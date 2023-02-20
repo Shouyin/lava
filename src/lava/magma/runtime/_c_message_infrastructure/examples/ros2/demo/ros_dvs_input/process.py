@@ -3,8 +3,7 @@
 # See: https://spdx.org/licenses/
 
 import numpy as np
-from PIL import Image
-
+from numpy.lib.stride_tricks import as_strided
 
 from lava.magma.core.process.process import AbstractProcess
 from lava.magma.core.process.ports.ports import OutPort
@@ -22,18 +21,10 @@ from lava.magma.runtime.message_infrastructure import (
     DDSBackendType,
 )
 
-from scipy.ndimage import gaussian_filter
 
-
-def numpy2pil(np_array: np.ndarray, fm="RGB") -> Image:
-    img = Image.fromarray(np_array, fm)
-    return img
-
-
-class RosRealsenseInput(AbstractProcess):
+class RosDVSInput(AbstractProcess):
     """
-    outputting a frame from ROS camera fetched from DDSChannel,
-    after converting it to events
+    outputting a frame from DVS camera fetched from DDSChannel
     """
 
     def __init__(
@@ -42,14 +33,12 @@ class RosRealsenseInput(AbstractProcess):
         true_width: int,
         down_sample_factor: int = 1,
         num_steps=1,
-        diff_thresh=10,
     ) -> None:
         super().__init__(
             true_height=true_height,
             true_width=true_width,
             down_sample_factor=down_sample_factor,
-            num_steps=num_steps,
-            diff_thresh=diff_thresh,
+            num_steps=num_steps
         )
 
         down_sampled_height = true_height // down_sample_factor
@@ -59,9 +48,9 @@ class RosRealsenseInput(AbstractProcess):
         self.event_frame_out = OutPort(shape=out_shape)
 
 
-@implements(proc=RosRealsenseInput, protocol=LoihiProtocol)
+@implements(proc=RosDVSInput, protocol=LoihiProtocol)
 @requires(CPU)
-class RosRealsenseInputPM(PyLoihiProcessModel):
+class RosDVSInputPM(PyLoihiProcessModel):
     event_frame_out: PyOutPort = LavaPyType(PyOutPort.VEC_DENSE, int)
 
     def __init__(self, proc_params):
@@ -85,7 +74,7 @@ class RosRealsenseInputPM(PyLoihiProcessModel):
         self._cur_steps = 0
 
         # DDSChannel relavent
-        name = "rt/camera/color/image_raw_dds"
+        name = 'rt/prophesee/PropheseeCamera_optical_frame/cd_events_buffer'
 
         self.dds_channel = GetDDSChannel(
             name,
@@ -97,55 +86,31 @@ class RosRealsenseInputPM(PyLoihiProcessModel):
         self.recv_port = self.dds_channel.dst_port
         self.recv_port.start()
 
-        # Frame comparison relv
-        self.diff_thresh = proc_params["diff_thresh"]
-        self.prev_frame = np.zeros((*self._frame_shape, 3))
-
-        self.saved = 0
-
-    def diff(self, frame1, frame2):
-        """
-        Comparing the difference between two frames
-        Remove the comment of the preferred operation
-        """
-        real_diffs = frame2 - frame1
-
-        # * OP: comparing the absolute color difference
-        # return (np.absolute(real_diffs[:, :, :]) > self.diff_thresh).sum(
-        #     axis=2
-        # ) > 0
-
-        # * OP: grayscale
-        # return ((frame2 * (1 / 3)).sum(axis=2)) / 255
-
-        # * OP: distance between colors
-        return np.linalg.norm(real_diffs, axis=2) > self.diff_thresh
-
     def run_spk(self):
         self._cur_steps += 1
 
         res = self.recv_port.recv()
-        width = int.from_bytes(
-            bytearray(np.flipud(res[12:16:]).tolist()),
-            byteorder="big",
-            signed=False,
-        )
-        height = int.from_bytes(
-            bytearray(np.flipud(res[16:20:]).tolist()),
-            byteorder="big",
-            signed=False,
-        )
-        img_data = res[20:]
-        img_data = img_data.reshape((height, width, 3))
+        stamp = int.from_bytes(bytearray(np.flipud(res[0:8]).tolist()),
+                            byteorder='big', signed=False)
+        width = int.from_bytes(bytearray(np.flipud(res[8:12:]).tolist()),
+                            byteorder='big', signed=False)
+        height = int.from_bytes(bytearray(np.flipud(res[12:16:]).tolist()),
+                                byteorder='big', signed=False)
+        # print("stamp nsec = ", stamp)
+        # print("width = ", width)
+        # print("height = ", height)
+        img_data = res[16:]
+        img_data = img_data.reshape(height, width)
 
-        # apply gaussian blur
-        event_frame_small = self._gaussian_downsample(img_data)
-        diff = self.diff(self.prev_frame, event_frame_small)
-        self.prev_frame = event_frame_small
+        img_data = \
+                self._pool_2d(img_data, kernel_size=self._down_sample_factor,
+                              stride=self._down_sample_factor, padding=0,
+                              pool_mode='max')
+        
 
         # * later codes assume (width, height) shaped image
-        diff = np.transpose(diff, axes=(1, 0))
-        self.event_frame_out.send(diff)
+        img_data = np.transpose(img_data, axes=(1, 0))
+        self.event_frame_out.send(img_data)
 
     def post_guard(self) -> bool:
         return self._cur_steps == self._num_steps
@@ -153,12 +118,23 @@ class RosRealsenseInputPM(PyLoihiProcessModel):
     def run_post_mgmt(self) -> None:
         self.recv_port.join()
 
-    # gaussian blur
-    def _gaussian_downsample(self, matrix: np.ndarray, kernel_size: int = 16):
-        event_frame_convolved = gaussian_filter(matrix, 8, radius=kernel_size)
+    def _pool_2d(self, matrix: np.ndarray, kernel_size: int, stride: int,
+                 padding: int = 0, pool_mode: str = 'max'):
+        # Padding
+        padded_matrix = np.pad(matrix, padding, mode='constant')
 
-        event_frame_small = event_frame_convolved[
-            :: self._down_sample_factor, :: self._down_sample_factor
-        ]
+        # Window view of A
+        output_shape = ((padded_matrix.shape[0] - kernel_size) // stride + 1,
+                        (padded_matrix.shape[1] - kernel_size) // stride + 1)
+        shape_w = (output_shape[0], output_shape[1], kernel_size, kernel_size)
+        strides_w = (stride * padded_matrix.strides[0],
+                     stride * padded_matrix.strides[1],
+                     padded_matrix.strides[0],
+                     padded_matrix.strides[1])
+        matrix_w = as_strided(padded_matrix, shape_w, strides_w)
 
-        return event_frame_small
+        # Return the result of pooling
+        if pool_mode == 'max':
+            return matrix_w.max(axis=(2, 3))
+        elif pool_mode == 'avg':
+            return matrix_w.mean(axis=(2, 3))

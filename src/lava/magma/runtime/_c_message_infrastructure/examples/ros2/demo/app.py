@@ -41,6 +41,7 @@ from sparse.process import Syn
 
 from process_out.process import ProcessOut, DataRelayerPM
 from ros_realsense_input.process import RosRealsenseInput, RosRealsenseInputPM
+from ros_dvs_input.process import RosDVSInput, RosDVSInputPM
 from rate_reader.process import RateReader
 
 
@@ -129,12 +130,13 @@ recv_pipe, send_pipe = Pipe()
 # ==========================================================================
 # Instantiate Processes Running on CPU
 # ==========================================================================
-roscam_input = RosRealsenseInput(
+
+roscam_input = RosDVSInput( # RosRealsenseInput(
     true_height=true_height,
     true_width=true_width,
     down_sample_factor=down_sample_factor,
     num_steps=num_steps,
-    diff_thresh=diff_thresh,
+    # diff_thresh=diff_thresh,
 )
 
 rate_reader_multi_peak = RateReader(
